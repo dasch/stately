@@ -41,9 +41,10 @@ const (
 type InstallerType string
 
 const (
-	Symlink InstallerType = "symlink"
-	Write   InstallerType = "write"
-	None    InstallerType = "none"
+	Symlink      InstallerType = "symlink"
+	Write        InstallerType = "write"
+	MergeSection InstallerType = "merge-section"
+	None         InstallerType = "none"
 )
 
 type ManifestFileHeader struct {
@@ -61,6 +62,8 @@ type ManifestFile struct {
 	Format       FormatType         `json:"format"`
 	Content      interface{}        `json:"-"`
 	Executable   bool               `json:"executable"`
+	SectionStart string             `json:"sectionStart,omitempty"`
+	SectionEnd   string             `json:"sectionEnd,omitempty"`
 }
 
 func (f *ManifestFile) ManifestFile(destination string, Logger *zap.SugaredLogger) (loc string, err error) {
@@ -75,6 +78,13 @@ func (f *ManifestFile) ManifestFile(destination string, Logger *zap.SugaredLogge
 
 	if f.Install == Symlink {
 		Logger.Infof("Installing as Symlink is not supported %s", f.Path)
+	}
+
+	if f.Install == MergeSection {
+		if err := f.MergeSectionRaw(dest); err != nil {
+			return "", err
+		}
+		return dest, nil
 	}
 
 	if f.Install == Write || f.Install == Symlink {
@@ -234,4 +244,72 @@ func (f *ManifestFile) WriteRaw(destination string) error {
 	}
 	writer.Flush()
 	return nil
+}
+
+// MergeSectionRaw manages a delimited section within an existing file.
+// Content between SectionStart and SectionEnd markers is replaced, while
+// content outside the markers is preserved. If the file does not exist,
+// it is created with only the managed section. If the file exists but
+// contains no markers, the managed section is appended.
+func (f *ManifestFile) MergeSectionRaw(destination string) error {
+	// Build the managed content string.
+	var managedContent string
+	c := reflect.ValueOf(f.Content)
+	switch c.Kind() {
+	case reflect.String:
+		managedContent = f.Content.(string)
+	default:
+		managedContent = fmt.Sprintf("%s", f.Content)
+	}
+
+	managedBlock := f.SectionStart + "\n" + managedContent + f.SectionEnd + "\n"
+
+	existing, err := os.ReadFile(destination)
+	if err != nil {
+		// File doesn't exist — write managed block only.
+		return os.WriteFile(destination, []byte(managedBlock), f.Permissions())
+	}
+
+	content := string(existing)
+	lines := strings.Split(content, "\n")
+
+	startIdx := -1
+	endIdx := -1
+	for i, line := range lines {
+		if strings.TrimSpace(line) == strings.TrimSpace(f.SectionStart) {
+			startIdx = i
+		}
+		if strings.TrimSpace(line) == strings.TrimSpace(f.SectionEnd) {
+			endIdx = i
+		}
+	}
+
+	var result string
+	if startIdx == -1 || endIdx == -1 || endIdx < startIdx {
+		// No valid managed section found — append.
+		if len(content) > 0 && !strings.HasSuffix(content, "\n") {
+			content += "\n"
+		}
+		if len(content) > 0 && !strings.HasSuffix(content, "\n\n") {
+			content += "\n"
+		}
+		result = content + managedBlock
+	} else {
+		// Replace existing managed section.
+		before := strings.Join(lines[:startIdx], "\n")
+		after := ""
+		if endIdx+1 < len(lines) {
+			after = strings.Join(lines[endIdx+1:], "\n")
+		}
+		result = before
+		if len(before) > 0 && !strings.HasSuffix(before, "\n") {
+			result += "\n"
+		}
+		result += managedBlock
+		if len(after) > 0 {
+			result += after
+		}
+	}
+
+	return os.WriteFile(destination, []byte(result), f.Permissions())
 }
